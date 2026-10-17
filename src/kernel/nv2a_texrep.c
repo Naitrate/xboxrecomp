@@ -47,6 +47,25 @@ void nv2a_texrep_register_hdr_image(const struct nv2a_texrep_tex *tex, unsigned 
     gen_next();
 }
 
+int nv2a_texrep_hdr_stage0_only(const uint8_t *guest, uint32_t color, uint32_t w,
+                                uint32_t h, uint32_t pitch)
+{
+    const struct nv2a_texrep_tex *ht = s_ht;
+    unsigned i, hn = s_hn;
+    uint64_t hash = 0;
+
+    for (i = 0; i < hn; i++) {
+        if (ht[i].color != color || ht[i].width != w || ht[i].height != h
+                || ht[i].n_variants < 1 || !ht[i].variants[0].stage0_only)
+            continue;
+        if (!hash)
+            hash = nv2a_texrep_hash(guest, color, w, h, pitch);
+        if (hash && hash == ht[i].hash)
+            return 1;
+    }
+    return 0;
+}
+
 static _Atomic int s_ab_off;      /* hdr_image_ab: the pictures are off in this block */
 
 void nv2a_texrep_set_hdr(int on)

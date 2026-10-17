@@ -45,3 +45,31 @@ void recomp_exit_hook_run(const char *why)
             fn(why);
     }
 }
+
+#define QUIT_HOOKS_MAX 8
+static recomp_quit_hook_fn volatile s_quit[QUIT_HOOKS_MAX];
+
+void recomp_quit_hook_add(recomp_quit_hook_fn fn)
+{
+    int i;
+
+    for (i = 0; i < QUIT_HOOKS_MAX; i++) {
+        if (s_quit[i] == fn)
+            return;
+        if (s_quit[i] == NULL) {
+            s_quit[i] = fn;
+            return;
+        }
+    }
+}
+
+void recomp_quit_hook_run(int stage)
+{
+    int i;
+
+    for (i = 0; i < QUIT_HOOKS_MAX; i++) {
+        recomp_quit_hook_fn fn = s_quit[i];
+        if (fn != NULL)
+            fn(stage);
+    }
+}

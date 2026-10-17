@@ -1797,6 +1797,7 @@ typedef struct {
     uint8_t        pend;          /* its scaled picture is being made (nv2a_texscale_get) */
     uint32_t       cut;           /* the alpha test its levels were made for (nv2a_texmip_cut_ref); 0: the title's */
     float          zbias;         /* nv2a_texrep_zbias of its bytes (BO-176); 0: none */
+    uint8_t        solo;          /* BO-203: nv2a_texrep_hdr_stage0_only of its bytes */
     uint32_t       pal_len, pgen; /* P8 entries; the flip pend was last asked at */
     uint64_t       skey;          /* nv2a_texscale_key of the texels uploaded */
     int            live;
@@ -1819,6 +1820,7 @@ static uint32_t       s_tc_clock;
 static uint32_t      *s_texels;
 static size_t         s_texels_cap;
 static id<MTLTexture> s_black, s_magenta;
+static id<MTLTexture> s_clear;   /* BO-203: transparent black, stages 1..3 of a stage0_only draw */
 
 static id<MTLTexture> solid_texture(uint32_t argb)
 {
@@ -1875,6 +1877,7 @@ static unsigned s_bind_scale;
 /* The depth offset the texture tex_bind returned asks for (nv2a_texrep_zbias,
  * BO-176); 0 for most. */
 static float s_bind_zbias;
+static int   s_bind_solo;    /* BO-203: the bound texture is a stage0_only HDR picture */
 static uint32_t *s_scaled;
 static size_t    s_scaled_cap;
 
@@ -2157,6 +2160,7 @@ static id<MTLTexture> tex_bind(const Stage *t)
 
     s_bind_scale = 0;
     s_bind_zbias = 0.0f;
+    s_bind_solo = 0;
     if (t->valid && (uint64_t)t->width * t->height <= TEX_MAX_TEXELS)
         bytes = nv2a_tex_extent(t->color, t->width, t->height, t->pitch, t->levels);
     /* The guest bytes are about to be hashed and decoded: a render target
@@ -2251,6 +2255,8 @@ static id<MTLTexture> tex_bind(const Stage *t)
                 e->cut = cut;
                 e->zbias = nv2a_texrep_zbias(mem + t->offset, t->color, t->width,
                                              t->height, t->pitch);
+                e->solo = (uint8_t)nv2a_texrep_hdr_stage0_only(mem + t->offset, t->color,
+                                                               t->width, t->height, t->pitch);
                 s_tex_changed++;
                 if (!nt)
                     return s_black;
@@ -2304,6 +2310,8 @@ static id<MTLTexture> tex_bind(const Stage *t)
         e->rep = s_tex_rep;
         e->zbias = nv2a_texrep_zbias(mem + t->offset, t->color, t->width, t->height,
                                      t->pitch);
+        e->solo = (uint8_t)nv2a_texrep_hdr_stage0_only(mem + t->offset, t->color, t->width,
+                                                       t->height, t->pitch);
         e->tex = nt;
         e->live = 1;
     }
@@ -2342,6 +2350,7 @@ static id<MTLTexture> tex_bind(const Stage *t)
     e->used = ++s_tc_clock;
     s_bind_scale = e->up_scale;
     s_bind_zbias = e->zbias;
+    s_bind_solo = e->solo;
     if (ui_scale_log())
         ui_scale_use(e, t, mem);
     return e->tex;
@@ -3640,6 +3649,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
     void *ip;
     int cull = 0, cull_all = 0;
     float zbias = 0.0f;
+    int solo = 0;                 /* BO-203: stage 0 is a stage0_only HDR picture */
     /* Stencil only on a Z24S8 zeta surface, as on the CPU. */
     int use_s = v->stencil_enable && ((g->format >> 4) & 0xF) == 2;
     int use_z = v->depth_enable || use_s;
@@ -3824,10 +3834,20 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                     sscale[k] = s_bind_scale;
                     if (zbias == 0.0f)
                         zbias = s_bind_zbias;
+                    if (k == 0)
+                        solo = s_bind_solo;
                 }
             }
             if (textured)
                 s_draws_tex++;
+            /* BO-203: an HDR picture that stands alone (the sun's disc): the
+             * other stages read transparent black, whatever the title bound. */
+            if (solo && s_clear && nv2a_texrep_hdr())
+                for (k = 1; k < 4; k++) {
+                    const Stage *t = &s_stage[k];
+                    if (t->mode && t->mode != 4 && !(t->mode == 3 && t->cube))
+                        stex[k] = s_clear;
+                }
         }
         /* BO-176: a registered decal's depth offset, added to the constant
          * part of the title's own polygon offset (vp_scale.w). */
@@ -4836,7 +4856,9 @@ static void hdr_texlog(const struct nv2a_pb_gpu *g)
     if ((!on && !watch) || !t->offset || !t->width)
         return;
     h = nv2a_texrep_hash(mem + t->offset, t->color, t->width, t->height, t->pitch);
-    if (watch && h == watch && g->blend_enable && g->blend_dfactor == 0x1
+    /* an additive draw of it, or (BO-203: the sun's disc) an alpha-tested one */
+    if (watch && h == watch && g->blend_enable
+            && (g->blend_dfactor == 0x1 || nv2a_pb_vsh_state()->atest_enable)
             && nv2a_pb_stream_tag() == NV2A_HDR_TAG_SCENE)
         s_hdr_watch_hit = 1;
     if (!on || nseen >= 4096)
@@ -4870,6 +4892,9 @@ static void hdr_dump(RenderTarget *rt, uint32_t w, uint32_t h)
 
     static uint32_t watch_last, watch_n;
     int watched = 0;
+    /* and the flip after each (with hdr_image_ab=1: the other state, the same moment) */
+    if (watch_n && flip == watch_last + 1u)
+        watched = 1;
     if (s_hdr_watch_hit) {
         s_hdr_watch_hit = 0;
         if (watch_n < 60 && flip - watch_last >= 20) {
@@ -5245,6 +5270,7 @@ const struct nv2a_pb_backend *nv2a_pb_metal_backend(void)
         @autoreleasepool {
             s_black = solid_texture(0xFF000000u);
             s_magenta = solid_texture(NV2A_TEX_MAGENTA);
+            s_clear = solid_texture(0x00000000u);
         }
     }
     return &s_metal_backend;

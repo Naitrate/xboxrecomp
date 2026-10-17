@@ -209,8 +209,21 @@ int main(void)
                 CHECK((texels[i] & 0x00FFFFFFu) == (g_img2[i] & 0x00FFFFFFu));
             CHECK((texels[W * H] & 0x00FFFFFFu) == 0x00112131u);            /* level 1: the box of the colours */
         }
+        /* stage0_only (the sun's disc): asked by hash, format and size,
+         * HDR on or off (the backend checks nv2a_texrep_hdr at the draw);
+         * not without the flag, not for another texture. */
+        CHECK(!nv2a_texrep_hdr_stage0_only(g_dxt, FMT_DXT5, W, H, 0));
+        hv.stage0_only = 1;
+        nv2a_texrep_register_hdr_image(&ht, 1);
+        CHECK(nv2a_texrep_hdr_stage0_only(g_dxt, FMT_DXT5, W, H, 0));
+        CHECK(!nv2a_texrep_hdr_stage0_only(g_other, FMT_DXT5, W, H, 0));
+        CHECK(!nv2a_texrep_hdr_stage0_only(g_dxt, FMT_DXT5, W, H * 2, 0));
+        nv2a_texrep_set_hdr(0);
+        CHECK(nv2a_texrep_hdr_stage0_only(g_dxt, FMT_DXT5, W, H, 0) && !nv2a_texrep_hdr());
+        nv2a_texrep_set_hdr(1);
         /* Forgotten: not a candidate any more. */
         nv2a_texrep_register_hdr_image(NULL, 0);
+        CHECK(!nv2a_texrep_hdr_stage0_only(g_dxt, FMT_DXT5, W, H, 0));
         nv2a_texrep_set_hdr(1);
         CHECK(nv2a_texrep_apply(g_dxt, FMT_DXT5, W, H, 0, 1, texels) == 0);
         nv2a_texrep_set_hdr(0);

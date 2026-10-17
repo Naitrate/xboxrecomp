@@ -1148,6 +1148,17 @@ static void wait_exit_hook(const char *why)
     wait_at_exit();
 }
 
+/* The window's way out (recomp_exit_hook.h, BO-219): the title is still
+ * running when the window loop ends, so a save on its way can finish now,
+ * before the title's executor is held for the teardown. The wait is the one
+ * the exit does later, moved up; this one is done and the later finds the
+ * guard idle. */
+static void wait_quit_hook(int stage)
+{
+    if (stage == RECOMP_QUIT_SETTLE && xbox_SaveGuardBusy())
+        wait_at_exit();
+}
+
 void xbox_SaveGuardEnable(const char *title_id)
 {
     static const char *const part[] = { "UDATA", "TDATA" };
@@ -1189,6 +1200,7 @@ void xbox_SaveGuardEnable(const char *title_id)
     if (!s_ready && s_n_roots > 0) {
         atexit(wait_at_exit);
         recomp_exit_hook_add(wait_exit_hook);
+        recomp_quit_hook_add(wait_quit_hook);
     }
     s_ready = s_n_roots > 0;
 }

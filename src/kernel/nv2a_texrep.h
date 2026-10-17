@@ -52,6 +52,15 @@ struct nv2a_texrep_variant {
      * the title's draw depends on: the alpha test and the occlusion count it
      * reads for its glare stay what the title made them. */
     uint32_t                       keep_alpha;
+    /* BO-203, HDR pictures only: nonzero: while the picture is in use
+     * (nv2a_texrep_hdr), a draw that binds this texture at stage 0 samples
+     * transparent black (0, 0, 0, 0) at stages 1..3, whatever the title bound
+     * there (nv2a_texrep_hdr_stage0_only). For a sprite whose combiner blends
+     * in another texture the draw does not map onto the sprite: the sun's
+     * disc lerps to the sky sheet by its alpha at a point (or a line) of it,
+     * so where the sky is bright the whole quad passes the alpha test as a
+     * flat or streaked patch, hidden in SDR's clipped white only. */
+    uint32_t                       stage0_only;
 };
 
 struct nv2a_texrep_tex {
@@ -112,6 +121,13 @@ void nv2a_texrep_stats(uint64_t *hashed, uint64_t *matched, uint64_t *replaced);
  * use is the sun's disc sprite, whose flat alpha plateau reads as a square
  * above paper white (a profile built at start, no asset shipped). */
 void nv2a_texrep_register_hdr_image(const struct nv2a_texrep_tex *tex, unsigned n);
+/* 1 when the texture is one of those pictures and its variant asks for
+ * stage0_only, whether HDR is on or not (a backend asks at upload and keeps
+ * the answer with its cache entry; at a draw it checks nv2a_texrep_hdr()).
+ * A few integer compares for any other format or size, a hash for a
+ * candidate. */
+int  nv2a_texrep_hdr_stage0_only(const uint8_t *guest, uint32_t color, uint32_t w,
+                                 uint32_t h, uint32_t pitch);
 void nv2a_texrep_set_hdr(int on);
 int  nv2a_texrep_hdr(void);        /* the pictures are in use now: HDR on, and not an A/B flip with them off */
 /* RECOMP_DEBUG=hdr_image_ab=n: the pictures are off for every other block of n

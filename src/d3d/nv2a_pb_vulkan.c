@@ -2422,6 +2422,7 @@ typedef struct {
     float            zbias;         /* nv2a_texrep_zbias of its bytes (BO-176); 0: none */
     uint64_t         rhash;         /* nv2a_texrep_hash, with zbias_probe/ztint only (BO-204) */
     const struct nv2a_texrep_hdr_gain *hgain;   /* BO-110: a registered light texture's; NULL: none */
+    uint8_t          solo;          /* BO-203: nv2a_texrep_hdr_stage0_only of its bytes */
     uint32_t         pal_len, pgen; /* P8 entries; the flip pend was last asked at */
     uint64_t         skey;          /* nv2a_texscale_key of the texels uploaded */
     int              live;
@@ -2443,6 +2444,7 @@ static uint32_t         s_tc_clock;
 static uint32_t        *s_texels;
 static size_t           s_texels_cap;
 static struct nvk_image s_black, s_magenta;
+static struct nvk_image s_clear;   /* BO-203: transparent black, stages 1..3 of a stage0_only draw */
 
 static int solid_texture(struct nvk_image *im, uint32_t argb)
 {
@@ -2504,6 +2506,7 @@ static unsigned  s_bind_scale;
 static float     s_bind_zbias;
 static uint64_t  s_bind_rhash, s_up_rhash;   /* BO-204 debug: texrep hash of the bind/upload */
 static const struct nv2a_texrep_hdr_gain *s_bind_hgain;   /* BO-110, as the depth offset */
+static int s_bind_solo;          /* BO-203: the bound texture is a stage0_only HDR picture */
 static uint32_t *s_scaled;
 static size_t    s_scaled_cap;
 
@@ -2815,6 +2818,7 @@ static VkImageView tex_bind(const Stage *t)
     s_bind_scale = 0;
     s_bind_zbias = 0.0f;
     s_bind_hgain = NULL;
+    s_bind_solo = 0;
 
     if (t->valid && (uint64_t)t->width * t->height <= TEX_MAX_TEXELS)
         bytes = nv2a_tex_extent(t->color, t->width, t->height, t->pitch, t->levels);
@@ -2907,6 +2911,8 @@ static VkImageView tex_bind(const Stage *t)
                 e->rhash = s_up_rhash;
                 e->hgain = nv2a_texrep_hdr_gain(mem + t->offset, t->color, t->width,
                                                 t->height, t->pitch);
+                e->solo = (uint8_t)nv2a_texrep_hdr_stage0_only(mem + t->offset, t->color,
+                                                               t->width, t->height, t->pitch);
                 e->im = ni;
                 e->scale = (uint8_t)want;
                 e->salgo = (uint8_t)algo;
@@ -2952,6 +2958,8 @@ static VkImageView tex_bind(const Stage *t)
         e->rhash = s_up_rhash;
         e->hgain = nv2a_texrep_hdr_gain(mem + t->offset, t->color, t->width, t->height,
                                         t->pitch);
+        e->solo = (uint8_t)nv2a_texrep_hdr_stage0_only(mem + t->offset, t->color, t->width,
+                                                       t->height, t->pitch);
         e->im = ni;
         e->live = 1;
     }
@@ -2993,6 +3001,7 @@ static VkImageView tex_bind(const Stage *t)
     s_bind_zbias = e->zbias;
     s_bind_rhash = e->rhash;
     s_bind_hgain = e->hgain;
+    s_bind_solo = e->solo;
     s_sn.scaled += e->up_scale != 0;
     if (ui_scale_log())
         ui_scale_use(e, t, mem);
@@ -3948,9 +3957,11 @@ static void hdr_gains_flip(uint32_t flip)
  * by texrep_dump's hash of stage 0's texture, once per combination (id n);
  * every 1800 flips (BO-195) an [HDRTEXN] line per combination with its draws
  * and the number of flips it was drawn in so far. */
+static int s_hdr_watch_hit;   /* hdr_watch: the watched texture drawn this frame (as Metal) */
 static void hdr_texlog(const struct nv2a_pb_gpu *g)
 {
     static int on = -1, nseen;
+    static uint64_t watch, watch_from;
     static uint64_t seen[4096], last_sum;
     static uint32_t ndraw[4096], nflip[4096], lflip[4096];
     static FILE *out;
@@ -3965,11 +3976,21 @@ static void hdr_texlog(const struct nv2a_pb_gpu *g)
         out = e && strchr(e, '/') ? fopen(e, "a") : NULL;
         if (!out)
             out = stderr;
+        e = recomp_env(RENV_HDR_WATCH);
+        watch = e ? strtoull(e, NULL, 16) : 0;
+        /* hdr_watch=<hash>@<flip>: from that flip on */
+        watch_from = e && strchr(e, '@') ? strtoull(strchr(e, '@') + 1, NULL, 10) : 0;
     }
-    if (!on || !t->offset || !t->width || !t->valid || nseen >= 4096)
+    if ((!on && !watch) || !t->offset || !t->width || !t->valid)
         return;
     mem = (const uint8_t *)xbox_GetMemoryOffset();
     h = nv2a_texrep_hash(mem + t->offset, t->color, t->width, t->height, t->pitch);
+    if (watch && h == watch && s_presents >= watch_from && g->blend_enable
+            && (g->blend_dfactor == 0x1 || nv2a_pb_vsh_state()->atest_enable)
+            && nv2a_pb_stream_tag() == HDR_TAG_SCENE)
+        s_hdr_watch_hit = 1;
+    if (!on || nseen >= 4096)
+        return;
     k = h ^ ((uint64_t)(g->blend_enable ? g->blend_sfactor : 0xFFFF) << 32)
           ^ ((uint64_t)(g->blend_enable ? g->blend_dfactor : 0xFFFF) << 16)
           ^ nv2a_pb_stream_tag();
@@ -4001,6 +4022,22 @@ static void hdr_texlog(const struct nv2a_pb_gpu *g)
                 t->height, g->blend_enable, g->blend_sfactor, g->blend_dfactor,
                 nv2a_pb_stream_tag(), (unsigned long long)s_presents, nseen,
                 v->atest_enable, v->atest_func, v->atest_ref);
+        /* BO-203: the other stages and the combiner words of the same draw. */
+        for (i = 1; i < 4; i++) {
+            const Stage *s = &s_stage[i];
+            if (!s->mode || !s->offset || !s->width)
+                continue;
+            fprintf(out, "[HDRTEX]   id %d stage %d mode %d tex %016llx fmt 0x%02x %ux%u off 0x%08x"
+                    " pitch %u levels %u\n", nseen, i, s->mode,
+                    (unsigned long long)nv2a_texrep_hash(mem + s->offset, s->color, s->width,
+                                                         s->height, s->pitch),
+                    s->color, s->width, s->height, s->offset, s->pitch, s->levels);
+        }
+        fprintf(out, "[HDRTEX]   id %d stage 0 mode %d off 0x%08x pitch %u rc_ctl 0x%08x fcw0 0x%08x"
+                " fcw1 0x%08x aicw %08x %08x aocw %08x %08x cicw %08x %08x cocw %08x %08x"
+                " mask 0x%08x\n", nseen, t->mode, t->offset, t->pitch, v->rc_ctl, v->rc_fcw0,
+                v->rc_fcw1, v->rc_aicw[0], v->rc_aicw[1], v->rc_aocw[0], v->rc_aocw[1],
+                v->rc_cicw[0], v->rc_cicw[1], v->rc_cocw[0], v->rc_cocw[1], g->color_keep);
     }
     seen[nseen++] = k;
     if (out != stderr)
@@ -4053,6 +4090,7 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
     uint64_t rhash = 0;               /* BO-204 debug */
     const Stage *rstage = NULL;
     const struct nv2a_texrep_hdr_gain *hgain = NULL;
+    int solo = 0;                     /* BO-203: stage 0 is a stage0_only HDR picture */
     int use_s = v->stencil_enable && ((g->format >> 4) & 0xF) == 2;
     int use_z = v->depth_enable || use_s;
     VkImageView sview[4];
@@ -4196,10 +4234,20 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
                 }
                 if (!hgain)
                     hgain = s_bind_hgain;
+                if (k == 0)
+                    solo = s_bind_solo;
             }
         }
         if (textured)
             s_draws_tex++;
+        /* BO-203: an HDR picture that stands alone (the sun's disc): the
+         * other stages read transparent black, whatever the title bound. */
+        if (solo && s_clear.view && nv2a_texrep_hdr())
+            for (k = 1; k < 4; k++) {
+                const Stage *t = &s_stage[k];
+                if (t->mode && t->mode != 4 && !(t->mode == 3 && t->cube))
+                    sview[k] = s_clear.view;
+            }
     }
     /* BO-110: a registered light texture's gain, on its scene draws. */
     if (hgain && s_hdr && pc.hdr[0] > 1.0f) {
@@ -4497,8 +4545,21 @@ static void hdr_dump(RenderTarget *rt, uint32_t w, uint32_t h)
     char path[1100];
     FILE *f;
 
+    static uint32_t watch_last, watch_n;
+    int watched = 0;
+    /* hdr_watch (as Metal): a flip that drew the watched texture, and the one after it */
+    if (watch_n && flip == watch_last + 1u)
+        watched = 1;
+    if (s_hdr_watch_hit) {
+        s_hdr_watch_hit = 0;
+        if (watch_n < 60 && flip - watch_last >= 20) {
+            watched = 1;
+            watch_last = flip;
+            watch_n++;
+        }
+    }
     if (!prefix || !*prefix || !w || !h || w > rt->hw || h > rt->hh
-            || !nv2a_pb_dump_at_listed(flip))
+            || !(watched || nv2a_pb_dump_at_listed(flip)))
         return;
     px = readback_raw(&rt->im, rt->hw, rt->hh, half ? 8u : 4u);
     if (!px)
@@ -6117,7 +6178,8 @@ static int init(void)
         return 0;
     }
     pc_start();
-    if (!solid_texture(&s_black, 0xFF000000u) || !solid_texture(&s_magenta, NV2A_TEX_MAGENTA)) {
+    if (!solid_texture(&s_black, 0xFF000000u) || !solid_texture(&s_magenta, NV2A_TEX_MAGENTA)
+            || !solid_texture(&s_clear, 0x00000000u)) {
         XR_ERROR( LOGP "base textures failed\n");
         return 0;
     }

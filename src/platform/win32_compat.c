@@ -731,16 +731,29 @@ HANDLE w32_open_handle(int fd, const char *host_path)
     return (HANDLE)o;
 }
 
+/* Whether h can be an object of this shim at all. The file calls below read
+ * h as a w32_object, and a title can hand them a value that is none: the
+ * pseudo-handles (-1, -2), which the bridge sign-extends from the guest's
+ * 32-bit ones, or a small synthetic value. Burnout 3's stream thread reads
+ * through a stream whose handle its close method has just set to -1
+ * (INVALID_HANDLE_VALUE): on the console NtReadFile fails and the title
+ * takes its error path; here the read dereferenced address -1 (BO-218). */
+static int w32_maybe_object(HANDLE h)
+{
+    return h && h != PSEUDO_CURRENT_PROCESS && h != PSEUDO_CURRENT_THREAD
+        && (uintptr_t)h >= 0x10000u;
+}
+
 int w32_handle_fd(HANDLE h)
 {
     w32_object *o = (w32_object *)h;
-    return (o && o->kind == K_FILE) ? o->fd : -1;
+    return (w32_maybe_object(h) && o->kind == K_FILE) ? o->fd : -1;
 }
 
 const char *w32_handle_path(HANDLE h)
 {
     w32_object *o = (w32_object *)h;
-    return (o && o->kind == K_FILE) ? o->file_path : NULL;
+    return (w32_maybe_object(h) && o->kind == K_FILE) ? o->file_path : NULL;
 }
 
 void w32_handle_set_path(HANDLE h, const char *host_path)
@@ -748,7 +761,7 @@ void w32_handle_set_path(HANDLE h, const char *host_path)
     w32_object *o = (w32_object *)h;
     char *old;
 
-    if (!o || o->kind != K_FILE)
+    if (!w32_maybe_object(h) || o->kind != K_FILE)
         return;
     old = o->file_path;
     o->file_path = host_path ? strdup(host_path) : NULL;

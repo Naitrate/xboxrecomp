@@ -89,6 +89,7 @@
 #include <SDL.h>
 #include "recomp_env.h"
 #include "recomp_restart.h"
+#include "recomp_exit_hook.h"
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -995,6 +996,11 @@ static int android_teardown_begin(int vk)
         held = xbox_HostHoldForExit(1500);
         XR_NOTICE("[TEARDOWN] the title's executor %s (%.1f ms)\n",
                 held ? "is held" : "was not held in time", td_ms());
+        /* The title is parked, so nothing waits on the GP doorbell any more:
+         * now the APU frame thread can go (BO-219). A title that was not held
+         * keeps its audio thread to the end of the process. */
+        if (held)
+            recomp_quit_hook_run(RECOMP_QUIT_HELPERS);
         quiet = nvk_backend_quiesce(1000);
         XR_NOTICE("[TEARDOWN] backend %s (%.1f ms)\n",
                 quiet ? "quiet" : "not quiet", td_ms());
@@ -1839,6 +1845,27 @@ int xbox_HostWindowMain(int (*guest_main)(void))
      * end; from here on the title's threads cannot start a motor again. */
     had_pads = xbox_InputAnyOpen();
     xbox_InputShutdown();
+
+    /* The title's threads are still running, and they must not be when the
+     * GPU, the window and SDL go (BO-219, BO-206): a submit after the Vulkan
+     * loader let go crashed the process (SIGSEGV in vkQueueSubmit, Steam
+     * Deck), and the APU thread queued to an audio device SDL_Quit had
+     * closed. In order: a save on its way finishes, the title's executor is
+     * parked at its next frame (not when the guest has returned: nothing
+     * flips), the helper threads stop. Each step is bounded and says so in
+     * the log when its time is up. */
+    recomp_quit_hook_run(RECOMP_QUIT_SETTLE);
+    if (quit)
+        recomp_quit_hook_run(RECOMP_QUIT_HOLD);
+#if !defined(__ANDROID__)
+    recomp_quit_hook_run(RECOMP_QUIT_HELPERS);
+#else
+    /* Android: the helpers (the APU frame thread) stop in
+     * android_teardown_begin, after it has held the title. The GP doorbell
+     * ack lives in that thread and the title spins on it (apu_core.c): with
+     * the thread gone first, a DirectSound command in that window could keep
+     * the title from reaching the hold. */
+#endif
 
     /* The guest is still running when the window closes, and there is no way
      * to stop lifted code mid-flight. exit() ends every thread; atexit

@@ -30,6 +30,7 @@
 #include "../kernel/kernel_prof.h"          /* RECOMP_TRACE=dpc: ISR, se_frame */
 #include "../kernel/kernel_pause.h"         /* xbox_HostPauseListener */
 #include "../platform/host_time.h"          /* the guest's clock */
+#include "../platform/recomp_exit_hook.h"   /* the window's way out (BO-206) */
 
 /* ============================================================
  * Globals
@@ -1332,6 +1333,9 @@ static void se_frame(MCPXAPUState *d)
 
 void xbox_log_thread_role(const char *role, uint32_t routine);
 
+static int s_frame_thread_done;      /* the frame thread has left its loop (atomic) */
+static int s_frame_thread_started;
+
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
@@ -1447,7 +1451,50 @@ static void *mcpx_apu_frame_thread(void *arg)
     }
 
     qemu_mutex_unlock(&d->lock);
+    qatomic_set(&s_frame_thread_done, 1);
     return NULL;
+}
+
+/* The way out (recomp_exit_hook.h, BO-206): the frame thread stops before the
+ * window layer takes SDL, and the audio device with it, down; until then it
+ * kept queueing to a device that was gone ("Invalid audio device ID", ten
+ * lines at a quit on Windows). It is told to leave its loop and given up to
+ * 500 ms; a thread that has not left by then is left alone (the process ends
+ * next). The state stays allocated: the title's threads still write the
+ * registers until the process is gone. */
+#define APU_QUIT_WAIT_MS 500
+
+static void apu_quit_hook(int stage)
+{
+    MCPXAPUState *d = g_state;
+    int waited = 0, locked = 0;
+
+    if (stage != RECOMP_QUIT_HELPERS || !d || !s_frame_thread_started
+        || qatomic_read(&s_frame_thread_done))
+        return;
+    /* The lock is the thread's for its whole loop but for a moment each
+     * frame; never waited on for good. */
+    while (!(locked = TryEnterCriticalSection(&d->lock.cs) != 0) && waited < APU_QUIT_WAIT_MS) {
+        Sleep(1);
+        waited++;
+    }
+    if (locked) {
+        qatomic_set(&d->exiting, true);
+        qemu_cond_broadcast(&d->cond);
+        qemu_mutex_unlock(&d->lock);
+    }
+    while (!qatomic_read(&s_frame_thread_done) && waited < APU_QUIT_WAIT_MS) {
+        Sleep(1);
+        waited++;
+    }
+    if (qatomic_read(&s_frame_thread_done)) {
+        qemu_thread_join(&d->apu_thread);
+        s_frame_thread_started = 0;
+        XR_NOTICE("[APU] frame thread stopped before the audio device closes (%d ms)\n", waited);
+    } else {
+        XR_ERROR("[APU] the frame thread did not stop in %d ms; the audio device closes under it\n",
+                 waited);
+    }
 }
 
 /* The in-game overlay's pause (kernel_pause.h): the frame thread idles as
@@ -1559,6 +1606,8 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     /* Start background frame thread */
     qemu_thread_create(&d->apu_thread, "mcpx.apu_thread",
                        mcpx_apu_frame_thread, d, QEMU_THREAD_JOINABLE);
+    s_frame_thread_started = 1;
+    recomp_quit_hook_add(apu_quit_hook);
     mcpx_apu_wait_for_idle(d);
     qemu_mutex_unlock(&d->lock);
 

@@ -5,6 +5,7 @@
 #include "kernel_pause.h"
 #include "xbox_crash.h"       /* g_xbox_flip_count */
 #include "platform/host_time.h"
+#include "recomp_exit_hook.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -25,11 +26,14 @@ static INIT_ONCE s_once = INIT_ONCE_STATIC_INIT;
 static void (*s_listener[PAUSE_LISTENERS])(int);
 static int s_n_listeners;
 
+static void pause_quit_hook(int stage);
+
 static BOOL CALLBACK pause_init(PINIT_ONCE o, PVOID p, PVOID *c)
 {
     (void)o; (void)p; (void)c;
     InitializeCriticalSection(&s_lock);
     InitializeConditionVariable(&s_cv);
+    recomp_quit_hook_add(pause_quit_hook);
     return TRUE;
 }
 
@@ -283,4 +287,30 @@ int xbox_HostHoldForExit(int timeout_ms)
         waited += 5;
     }
     return s_held ? 1 : 0;
+}
+
+/* The window's way out (recomp_exit_hook.h, BO-219): the title's executor is
+ * parked at its next frame before the GPU and the audio device are taken
+ * down, so nothing of the title submits to a device that is going away. A
+ * title that does not reach a frame in time (a load) is left running, as
+ * before, and the log says so. The Android window holds it itself. */
+#define QUIT_HOLD_MS 400
+
+static void pause_quit_hook(int stage)
+{
+#if !defined(__ANDROID__)
+    if (stage == RECOMP_QUIT_HOLD) {
+        uint64_t t0 = xbox_HostNowNs();
+        int held = xbox_HostHoldForExit(QUIT_HOLD_MS);
+        double ms = (double)(xbox_HostNowNs() - t0) / 1e6;
+
+        if (held)
+            XR_NOTICE("[QUIT] the title's executor is held at a frame (%.1f ms)\n", ms);
+        else
+            XR_ERROR("[QUIT] the title did not reach a frame in %d ms: it runs on while the window closes\n",
+                     QUIT_HOLD_MS);
+    }
+#else
+    (void)stage;
+#endif
 }

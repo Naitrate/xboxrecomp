@@ -117,6 +117,38 @@ int main(int argc, char **argv)
     st = query("D:\\media\\event\\EVCAMST0101_005.CAM");
     check((uint32_t)st == 0xC0000034u, "missing directory: NAME_NOT_FOUND too", (unsigned)st);
 
+    /* A read through a handle that is no file (BO-218): Burnout 3's stream
+     * thread reads through a stream its close method has just set to
+     * INVALID_HANDLE_VALUE, which reaches the kernel as the pseudo-handle
+     * NtCurrentProcess() (-1). The console fails the call and the title
+     * takes its error path; the POSIX shim read -1 as an object and the
+     * process died of SIGSEGV. Every host: a failure status, no fault. */
+    printf("read and write through a handle that is no file\n");
+    {
+        static const struct { HANDLE h; const char *name; } bad[] = {
+            { (HANDLE)(intptr_t)-1, "NtCurrentProcess() (-1)" },
+            { (HANDLE)(intptr_t)-2, "NtCurrentThread() (-2)" },
+            { (HANDLE)0,            "NULL" },
+        };
+        char line[96], buf[64];
+        unsigned i;
+        for (i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+            XBOX_IO_STATUS_BLOCK ios;
+            memset(&ios, 0, sizeof ios);
+            st = xbox_NtReadFile(bad[i].h, NULL, NULL, NULL, &ios, buf, sizeof buf, NULL);
+            snprintf(line, sizeof line, "NtReadFile on %s fails", bad[i].name);
+            check(!NT_SUCCESS(st), line, (unsigned)st);
+#if !defined(_WIN32)
+            snprintf(line, sizeof line, "... with STATUS_INVALID_HANDLE");
+            check((uint32_t)st == 0xC0000008u, line, (unsigned)st);
+#endif
+            memset(&ios, 0, sizeof ios);
+            st = xbox_NtWriteFile(bad[i].h, NULL, NULL, NULL, &ios, buf, sizeof buf, NULL);
+            snprintf(line, sizeof line, "NtWriteFile on %s fails", bad[i].name);
+            check(!NT_SUCCESS(st), line, (unsigned)st);
+        }
+    }
+
     printf("%s (%d failure%s)\n", failures ? "FAILED" : "OK", failures, failures == 1 ? "" : "s");
     return failures ? 1 : 0;
 }
